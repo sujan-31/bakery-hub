@@ -32,6 +32,8 @@ export default function AdminPage() {
     cakes, 
     orders, 
     stats, 
+    isCloudConnected,
+    refreshOrders,
     updateOrderStatus, 
     toggleCakeStock, 
     updateCakePrice, 
@@ -42,6 +44,13 @@ export default function AdminPage() {
   const [orderFilter, setOrderFilter] = useState<string>('all');
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedTicketOrder, setSelectedTicketOrder] = useState<Order | null>(null);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+
+  const handleManualRefresh = async () => {
+    setIsRefreshing(true);
+    await refreshOrders();
+    setTimeout(() => setIsRefreshing(false), 500);
+  };
 
   // Active prep orders (pending, baking, decorating)
   const prepOrders = orders.filter(o => ['pending', 'baking', 'decorating'].includes(o.status));
@@ -97,6 +106,23 @@ export default function AdminPage() {
         </div>
 
         <div className="flex items-center gap-3">
+          {isCloudConnected ? (
+            <button
+              onClick={handleManualRefresh}
+              disabled={isRefreshing}
+              className="px-3 py-2 rounded-xl border border-emerald-300 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 text-xs font-bold flex items-center gap-1.5 transition-all shadow-sm"
+              title="Refresh orders from cloud database"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin' : ''}`} />
+              <span>{isRefreshing ? 'Syncing...' : 'Live Cloud Synced 🟢'}</span>
+            </button>
+          ) : (
+            <div className="hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-amber-100/80 text-amber-900 text-xs font-semibold border border-amber-300">
+              <span className="w-2 h-2 rounded-full bg-amber-500" />
+              <span>Device-Local Mode</span>
+            </div>
+          )}
+
           <button
             onClick={() => {
               if (confirm('Reset demo data back to default sample orders and revenue?')) {
@@ -118,6 +144,21 @@ export default function AdminPage() {
           </Link>
         </div>
       </div>
+
+      {/* Cloud DB Notice if not yet configured */}
+      {!isCloudConnected && (
+        <div className="p-4 rounded-2xl bg-amber-50/90 border border-amber-200/90 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs text-amber-950">
+          <div className="flex items-start gap-2.5">
+            <AlertTriangle className="w-4 h-4 text-amber-700 flex-shrink-0 mt-0.5" />
+            <div>
+              <p className="font-bold">Why aren&apos;t orders from other phones showing up here?</p>
+              <p className="text-amber-800 text-[11px] mt-0.5">
+                Orders are currently saved in each phone&apos;s local browser storage. To receive customer orders from other devices anywhere in the world, connect your free Supabase cloud database!
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* KPI Stats Grid */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">

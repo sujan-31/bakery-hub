@@ -1,11 +1,12 @@
 'use client';
 
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import { CakeItem, Order, OrderItem, OrderStatus, BakeryStats } from '@/types';
 import { INITIAL_CAKES, INITIAL_ORDERS } from '@/lib/data';
+import { supabase, isSupabaseConfigured } from '@/lib/supabase';
 
 interface CartItem extends OrderItem {
-  id: string; // unique item instance id in cart
+  id: string;
 }
 
 interface BakeryContextType {
@@ -14,6 +15,7 @@ interface BakeryContextType {
   cart: CartItem[];
   stats: BakeryStats;
   isLoaded: boolean;
+  isCloudConnected: boolean;
   // Cart Actions
   addToCart: (item: Omit<CartItem, 'id'>) => void;
   removeFromCart: (cartItemId: string) => void;
@@ -26,6 +28,7 @@ interface BakeryContextType {
   updateOrderStatus: (orderId: string, newStatus: OrderStatus) => void;
   getOrderById: (orderId: string) => Order | undefined;
   getOrdersByPhone: (phone: string) => Order[];
+  refreshOrders: () => Promise<void>;
   // Catalog Actions
   toggleCakeStock: (cakeId: string) => void;
   updateCakePrice: (cakeId: string, newBasePrice: number) => void;
@@ -44,7 +47,44 @@ export const BakeryProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const [cart, setCart] = useState<CartItem[]>([]);
   const [isLoaded, setIsLoaded] = useState(false);
 
-  // Load from LocalStorage on mount
+  // Helper to fetch orders from Supabase cloud
+  const fetchOrdersFromCloud = useCallback(async () => {
+    if (!supabase) return;
+    try {
+      const { data, error } = await supabase
+        .from('orders')
+        .select('*')
+        .order('created_at', { ascending: false });
+
+      if (!error && data && data.length > 0) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const formatted: Order[] = data.map((row: any) => ({
+          id: row.id,
+          customerName: row.customer_name,
+          customerPhone: row.customer_phone,
+          customerEmail: row.customer_email,
+          deliveryType: row.delivery_type,
+          deliveryAddress: row.delivery_address,
+          pickupDate: row.pickup_date,
+          pickupTime: row.pickup_time,
+          specialInstructions: row.special_instructions,
+          items: typeof row.items === 'string' ? JSON.parse(row.items) : row.items,
+          subtotal: Number(row.subtotal),
+          tax: Number(row.tax),
+          totalAmount: Number(row.total_amount),
+          status: row.status as OrderStatus,
+          createdAt: row.created_at,
+          isPaid: Boolean(row.is_paid),
+          paymentMethod: row.payment_method
+        }));
+        setOrders(formatted);
+      }
+    } catch (e) {
+      console.warn('Could not fetch orders from cloud DB:', e);
+    }
+  }, []);
+
+  // Initial load
   useEffect(() => {
     try {
       const savedCakes = localStorage.getItem(CAKES_STORAGE_KEY);
@@ -55,13 +95,36 @@ export const BakeryProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       if (savedOrders) setOrders(JSON.parse(savedOrders));
       if (savedCart) setCart(JSON.parse(savedCart));
     } catch (e) {
-      console.warn('Failed to parse saved bakery data from localStorage:', e);
+      console.warn('Failed to parse saved data from localStorage:', e);
     } finally {
       setIsLoaded(true);
     }
-  }, []);
 
-  // Save to LocalStorage whenever state changes
+    // If Supabase is connected, pull cloud orders
+    if (isSupabaseConfigured && supabase) {
+      fetchOrdersFromCloud();
+
+      // Subscribe to real-time order updates
+      const channel = supabase
+        .channel('public:orders')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'orders' }, () => {
+          fetchOrdersFromCloud();
+        })
+        .subscribe();
+
+      // Poll every 10 seconds as a reliable fallback
+      const interval = setInterval(fetchOrdersFromCloud, 10000);
+
+      return () => {
+        if (supabase) {
+          supabase.removeChannel(channel);
+        }
+        clearInterval(interval);
+      };
+    }
+  }, [fetchOrdersFromCloud]);
+
+  // Sync state to LocalStorage
   useEffect(() => {
     if (!isLoaded) return;
     try {
@@ -127,8 +190,39 @@ export const BakeryProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       status: 'pending'
     };
 
+    // Update local state immediately
     setOrders(prev => [newOrder, ...prev]);
     clearCart();
+
+    // If Supabase is connected, push to shared cloud database!
+    if (supabase) {
+      supabase.from('orders').insert({
+        id: newOrder.id,
+        customer_name: newOrder.customerName,
+        customer_phone: newOrder.customerPhone,
+        customer_email: newOrder.customerEmail,
+        delivery_type: newOrder.deliveryType,
+        delivery_address: newOrder.deliveryAddress || null,
+        pickup_date: newOrder.pickupDate,
+        pickup_time: newOrder.pickupTime,
+        special_instructions: newOrder.specialInstructions || null,
+        items: newOrder.items,
+        subtotal: newOrder.subtotal,
+        tax: newOrder.tax,
+        total_amount: newOrder.totalAmount,
+        status: newOrder.status,
+        is_paid: newOrder.isPaid,
+        payment_method: newOrder.paymentMethod,
+        created_at: newOrder.createdAt
+      }).then(({ error }) => {
+        if (error) {
+          console.error('Failed to sync order to cloud Supabase:', error);
+        } else {
+          console.log('Order successfully synced to cloud Supabase!');
+        }
+      });
+    }
+
     return newOrder;
   };
 
@@ -139,6 +233,12 @@ export const BakeryProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       }
       return order;
     }));
+
+    if (supabase) {
+      supabase.from('orders').update({ status: newStatus }).eq('id', orderId).then(({ error }) => {
+        if (error) console.error('Failed to update status in cloud DB:', error);
+      });
+    }
   };
 
   const getOrderById = (orderId: string) => {
@@ -189,7 +289,6 @@ export const BakeryProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     .filter(o => o.status !== 'cancelled')
     .reduce((sum, o) => sum + o.items.reduce((itemSum, item) => itemSum + item.quantity, 0), 0);
 
-  // Cakes that need kitchen preparation: orders that are 'pending', 'baking', or 'decorating'
   const activePrepOrders = orders.filter(o => ['pending', 'baking', 'decorating'].includes(o.status));
   const cakesToPrepareCount = activePrepOrders.reduce((sum, o) => sum + o.items.reduce((itemSum, item) => itemSum + item.quantity, 0), 0);
 
@@ -214,6 +313,7 @@ export const BakeryProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         cart,
         stats,
         isLoaded,
+        isCloudConnected: isSupabaseConfigured,
         addToCart,
         removeFromCart,
         updateCartQuantity,
@@ -224,6 +324,7 @@ export const BakeryProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         updateOrderStatus,
         getOrderById,
         getOrdersByPhone,
+        refreshOrders: fetchOrdersFromCloud,
         toggleCakeStock,
         updateCakePrice,
         resetToSampleData
